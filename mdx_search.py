@@ -2,16 +2,19 @@
 """
 mdx_search.py — find new Acura MDX listings around Yuba City, CA.
 
-Scrapes the nearest Acura dealers' inventory pages (no API key, no credit card)
-and prints what's for sale right now: price, MSRP, discount, trim, and a link.
-Also writes a dated CSV of the listings and appends a summary row to
-mdx_history.csv so you can watch the trend over time.
+Dealer sites block bare HTTP requests (403), so by default this renders each
+page with a real headless Chromium via Playwright, then parses the structured
+schema.org JSON-LD. No API key, no credit card.
+
+Setup:
+    pip install -r requirements.txt
+    python -m playwright install chromium
 
 Usage:
-    pip install requests beautifulsoup4
-    python mdx_search.py                # search around Yuba City
-    python mdx_search.py --json         # machine-readable output
-    python mdx_search.py --debug        # show JSON-LD block counts per page
+    python mdx_search.py            # render with Chromium (default)
+    python mdx_search.py --requests # plain HTTP (fast, but dealers 403 it)
+    python mdx_search.py --json     # machine-readable output
+    python mdx_search.py --debug    # show diagnostics per page
 
 Add or change dealers in the DEALERS list below.
 """
@@ -51,7 +54,7 @@ DEALERS = [
 
 MODEL = "MDX"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 MSRP_HINTS = ("msrp", "listprice", "list price", "schema.org/msrp")
 
 
@@ -68,21 +71,60 @@ def num(v):
     return None
 
 
-def fetch(url, debug=False):
-    for attempt in range(3):
-        try:
-            r = requests.get(url, headers={"User-Agent": UA,
-                                           "Accept": "text/html,application/xhtml+xml"},
-                             timeout=45)
-            r.raise_for_status()
-            return r.text
-        except Exception as e:  # noqa: BLE001
-            if debug:
-                print(f"    fetch attempt {attempt+1} failed: {e}", file=sys.stderr)
-            time.sleep(1.5 * (attempt + 1))
-    return ""
+# ---- fetching ---------------------------------------------------------------
+def fetch_requests(url, debug=False):
+    try:
+        r = requests.get(url, headers={"User-Agent": UA,
+                                       "Accept": "text/html,application/xhtml+xml"},
+                         timeout=45)
+        r.raise_for_status()
+        return r.text
+    except Exception as e:  # noqa: BLE001
+        if debug:
+            print(f"    requests failed: {e}", file=sys.stderr)
+        return ""
 
 
+def render_all(urls, debug=False):
+    """Render each URL with a real headless Chromium; return {url: html}."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("Playwright not installed. Run:\n"
+              "    pip install playwright\n"
+              "    python -m playwright install chromium\n"
+              "(or use --requests, though dealers tend to 403 that).", file=sys.stderr)
+        sys.exit(1)
+
+    out = {}
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+        )
+        ctx = browser.new_context(user_agent=UA, locale="en-US",
+                                  viewport={"width": 1366, "height": 900})
+        ctx.add_init_script(
+            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+        page = ctx.new_page()
+        for url in urls:
+            try:
+                if debug:
+                    print(f"  render {url}", file=sys.stderr)
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(3500)  # let inventory JS populate
+                out[url] = page.content()
+                if debug:
+                    print(f"    got {len(out[url])} bytes", file=sys.stderr)
+            except Exception as e:  # noqa: BLE001
+                if debug:
+                    print(f"    render failed: {e}", file=sys.stderr)
+                out[url] = ""
+        browser.close()
+    return out
+
+
+# ---- parsing ----------------------------------------------------------------
 def walk(node):
     if isinstance(node, dict):
         yield node
@@ -159,14 +201,18 @@ def matches_mdx(node):
     return MODEL.lower() in hay.lower()
 
 
-def search(debug=False):
+def search(use_requests=False, debug=False):
+    pairs = [(d, u) for d in DEALERS for u in d["urls"]]
+    if use_requests:
+        htmls = {u: fetch_requests(u, debug) for _, u in pairs}
+    else:
+        htmls = render_all([u for _, u in pairs], debug)
+
     all_rows, per_dealer = [], []
     for d in DEALERS:
         seen, found = set(), []
         for url in d["urls"]:
-            if debug:
-                print(f"  GET {url}", file=sys.stderr)
-            text = fetch(url, debug=debug)
+            text = htmls.get(url, "")
             if not text:
                 continue
             for node in jsonld_nodes(text, debug=debug):
@@ -198,11 +244,12 @@ def money(n):
 def main():
     ap = argparse.ArgumentParser(description="Find new Acura MDX listings around Yuba City.")
     ap.add_argument("--json", action="store_true", help="output JSON instead of a table")
+    ap.add_argument("--requests", action="store_true", help="use plain HTTP (dealers 403 it)")
     ap.add_argument("--debug", action="store_true", help="show scraping diagnostics")
     ap.add_argument("--no-csv", action="store_true", help="don't write CSV files")
     args = ap.parse_args()
 
-    rows, per_dealer = search(debug=args.debug)
+    rows, per_dealer = search(use_requests=args.requests, debug=args.debug)
     rows.sort(key=lambda r: (r["price"] is None, r["price"] or 0))
 
     if args.json:
@@ -217,9 +264,8 @@ def main():
     print()
 
     if not rows:
-        print("No listings parsed. The dealer pages may load inventory via JavaScript.")
-        print("Run `python mdx_search.py --debug` to check, or open the URLs and confirm")
-        print("cars appear in 'View Source'. See README for a headless-browser fallback.\n")
+        print("No listings parsed. Run `python mdx_search.py --debug` to see whether pages")
+        print("were blocked (403 / 0 bytes) or returned no JSON-LD, and share the output.\n")
         return
 
     print(f"  {'PRICE':>9}  {'MSRP':>9}  {'SAVE':>7}  {'TRIM / NAME':<34} DEALER")
@@ -246,14 +292,14 @@ def main():
 
     if not args.no_csv:
         detail = f"mdx_listings_{today}.csv"
-        with open(detail, "w", newline="") as f:
+        with open(detail, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=["price", "msrp", "discount", "name",
                                               "vin", "dealer", "city", "url"])
             w.writeheader()
             w.writerows(rows)
         hist = "mdx_history.csv"
         new = not os.path.exists(hist)
-        with open(hist, "a", newline="") as f:
+        with open(hist, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             if new:
                 w.writerow(["date", "num_found", "price_min", "price_median",
