@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .DS_Store
+ld_*.txt
+debug_*.json
+dump_ld.py

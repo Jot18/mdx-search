@@ -2,25 +2,21 @@
 """
 mdx_search.py — find new Acura MDX listings around Yuba City, CA.
 
-Source-aware per dealer:
-  * DealerInspire dealers (e.g. Elk Grove Acura) expose a sanctioned, JS-free
-    /llm/inventory/ endpoint. Parsed with plain HTTP — no browser, works from
-    anywhere including GitHub cloud runners.
-  * Dealer.com dealers (e.g. Niello Acura) block plain requests and render
-    inventory with JavaScript, so those are loaded with a real headless
-    Chromium (Playwright) and read from schema.org JSON-LD.
+Dealer sites block bare HTTP (403). Each fetch tries a full-browser-header
+request first, then falls back to a real headless Chromium (Playwright) — the
+fingerprint that gets past the WAF. Run on your home IP / a self-hosted runner.
 
-If Playwright isn't installed (or a render fails), Dealer.com dealers are
-skipped with a warning and the /llm/ dealers still return results.
+  * Elk Grove Acura — sanctioned /llm/inventory/ endpoint (clean text listings).
+  * Niello Acura     — Dealer.com; read from schema.org JSON-LD.
 
 Setup:
     pip install -r requirements.txt
-    python -m playwright install chromium   # only needed for Dealer.com dealers
+    python -m playwright install chromium
 
 Usage:
-    python mdx_search.py           # search around Yuba City
+    python mdx_search.py
+    python mdx_search.py --debug     # diagnostics + writes debug_<dealer>.json
     python mdx_search.py --json
-    python mdx_search.py --debug
 """
 import os
 import re
@@ -54,6 +50,19 @@ DEALERS = [
 MODEL = "MDX"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+HEADERS = {
+    "User-Agent": UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Ch-Ua": '"Chromium";v="126", "Google Chrome";v="126", "Not:A-Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
 MSRP_HINTS = ("msrp", "listprice", "list price", "schema.org/msrp")
 
 
@@ -70,19 +79,65 @@ def num(v):
     return None
 
 
-def fetch_requests(url, debug=False):
-    try:
-        r = requests.get(url, headers={"User-Agent": UA, "Accept": "text/html"},
-                         timeout=45)
-        r.raise_for_status()
-        return r.text
-    except Exception as e:  # noqa: BLE001
-        if debug:
-            print(f"    requests failed: {e}", file=sys.stderr)
-        return ""
+# --- fetcher: rich-header request, then Chromium fallback --------------------
+class Fetcher:
+    def __init__(self, debug=False):
+        self.debug = debug
+        self._pw = self._browser = self._page = None
+
+    def _ensure_browser(self):
+        if self._page:
+            return
+        from playwright.sync_api import sync_playwright  # raises ImportError if absent
+        self._pw = sync_playwright().start()
+        self._browser = self._pw.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"])
+        ctx = self._browser.new_context(user_agent=UA, locale="en-US",
+                                        viewport={"width": 1366, "height": 900})
+        ctx.add_init_script(
+            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+        self._page = ctx.new_page()
+
+    def get(self, url):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=45)
+            r.raise_for_status()
+            if self.debug:
+                print(f"    requests ok ({len(r.text)} b)", file=sys.stderr)
+            return r.text
+        except Exception as e:  # noqa: BLE001
+            if self.debug:
+                print(f"    requests failed ({e}); rendering with Chromium", file=sys.stderr)
+        try:
+            self._ensure_browser()
+            self._page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            self._page.wait_for_timeout(3500)
+            content = self._page.content()
+            if self.debug:
+                print(f"    rendered ({len(content)} b)", file=sys.stderr)
+            return content
+        except ImportError:
+            print(f"  Playwright not installed — can't bypass 403 for {url}\n"
+                  f"    pip install playwright && python -m playwright install chromium",
+                  file=sys.stderr)
+            return ""
+        except Exception as e:  # noqa: BLE001
+            if self.debug:
+                print(f"    render failed ({e})", file=sys.stderr)
+            return ""
+
+    def close(self):
+        try:
+            if self._browser:
+                self._browser.close()
+            if self._pw:
+                self._pw.stop()
+        except Exception:  # noqa: BLE001
+            pass
 
 
-# --- DealerInspire /llm/ endpoint (plain HTTP, no browser) --------------------
+# --- DealerInspire /llm/ endpoint --------------------------------------------
 LLM_BLOCK = re.compile(
     r"-\s*\[(?P<title>[^\]]+)\]\((?P<url>https?://[^)]+)\)\s*\n"
     r"\s*(?P<cond>New|Certified Used|Used)\b[^\n]*\n"
@@ -92,16 +147,17 @@ LLM_BLOCK = re.compile(
 )
 
 
-def parse_llm(dealer, debug=False):
+def parse_llm(dealer, fetcher, debug=False):
     found, seen = [], set()
     page, total_pages = 1, 1
     while page <= total_pages and page <= 8:
         url = f"{dealer['base']}?make=Acura&limit=100&page={page}"
         if debug:
             print(f"  GET {url}", file=sys.stderr)
-        text = fetch_requests(url, debug)
-        if not text:
+        raw = fetcher.get(url)
+        if not raw:
             break
+        text = BeautifulSoup(raw, "html.parser").get_text("\n")
         m = re.search(r"Page\s+\d+\s+of\s+(\d+)", text)
         if m:
             total_pages = int(m.group(1))
@@ -125,45 +181,7 @@ def parse_llm(dealer, debug=False):
     return found
 
 
-# --- Dealer.com via Playwright + JSON-LD --------------------------------------
-def render_all(urls, debug=False):
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        print("  (Playwright not installed — skipping Dealer.com dealers. "
-              "Run `pip install playwright && python -m playwright install chromium` "
-              "to include them.)", file=sys.stderr)
-        return {}
-    out = {}
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"])
-            ctx = browser.new_context(user_agent=UA, locale="en-US",
-                                      viewport={"width": 1366, "height": 900})
-            ctx.add_init_script(
-                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
-            page = ctx.new_page()
-            for url in urls:
-                try:
-                    if debug:
-                        print(f"  render {url}", file=sys.stderr)
-                    page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                    page.wait_for_timeout(3500)
-                    out[url] = page.content()
-                    if debug:
-                        print(f"    got {len(out[url])} bytes", file=sys.stderr)
-                except Exception as e:  # noqa: BLE001
-                    if debug:
-                        print(f"    render failed: {e}", file=sys.stderr)
-                    out[url] = ""
-            browser.close()
-    except Exception as e:  # noqa: BLE001
-        print(f"  (browser error: {e})", file=sys.stderr)
-    return out
-
-
+# --- Dealer.com JSON-LD ------------------------------------------------------
 def walk(node):
     if isinstance(node, dict):
         yield node
@@ -174,11 +192,16 @@ def walk(node):
             yield from walk(v)
 
 
-def jsonld_nodes(text, debug=False):
+def jsonld_nodes(text, debug=False, dump_path=None):
     soup = BeautifulSoup(text, "html.parser")
     blocks = soup.find_all("script", attrs={"type": "application/ld+json"})
     if debug:
         print(f"    {len(blocks)} JSON-LD block(s)", file=sys.stderr)
+    if dump_path:
+        with open(dump_path, "w", encoding="utf-8") as f:
+            f.write("\n\n---\n\n".join(
+                html.unescape((b.string or b.get_text() or "")) for b in blocks))
+        print(f"    wrote {dump_path}", file=sys.stderr)
     for b in blocks:
         raw = html.unescape((b.string or b.get_text() or "")).strip()
         if not raw:
@@ -224,6 +247,11 @@ def name_of(node):
     return str(n).strip()
 
 
+def is_vehicle(node):
+    t = str(node.get("@type", "")).lower()
+    return t in ("car", "vehicle", "product", "individualproduct") or "vin" in node
+
+
 def matches_mdx(node):
     hay = " ".join(str(node.get(k, "")) for k in ("name", "model", "description", "sku"))
     if isinstance(node.get("model"), dict):
@@ -231,14 +259,17 @@ def matches_mdx(node):
     return MODEL.lower() in hay.lower()
 
 
-def parse_jsonld(dealer, htmls, debug=False):
+def parse_jsonld(dealer, fetcher, debug=False):
     found, seen = [], set()
-    for url in dealer["urls"]:
-        text = htmls.get(url, "")
-        if not text:
+    for i, url in enumerate(dealer["urls"]):
+        if debug:
+            print(f"  GET {url}", file=sys.stderr)
+        raw = fetcher.get(url)
+        if not raw:
             continue
-        for node in jsonld_nodes(text, debug=debug):
-            if not isinstance(node, dict) or not matches_mdx(node):
+        dump = f"debug_{dealer['name'].split()[0].lower()}_{i}.json" if debug else None
+        for node in jsonld_nodes(raw, debug=debug, dump_path=dump):
+            if not isinstance(node, dict) or not is_vehicle(node) or not matches_mdx(node):
                 continue
             sale, msrp = prices_from(node)
             if sale is None and msrp is None:
@@ -249,26 +280,24 @@ def parse_jsonld(dealer, htmls, debug=False):
                 continue
             seen.add(key)
             disc = (msrp - sale) if (msrp and sale and msrp >= sale) else None
-            u = node.get("url") or ""
             found.append({"price": sale, "msrp": msrp, "discount": disc,
-                          "name": name_of(node), "vin": vin, "url": u,
+                          "name": name_of(node), "vin": vin, "url": node.get("url", ""),
                           "dealer": dealer["name"], "city": dealer["city"]})
     return found
 
 
 # --- driver -------------------------------------------------------------------
 def search(debug=False):
-    render_urls = [u for d in DEALERS if d["kind"] == "jsonld_render" for u in d["urls"]]
-    htmls = render_all(render_urls, debug) if render_urls else {}
-
+    fetcher = Fetcher(debug)
     all_rows, per_dealer = [], []
-    for d in DEALERS:
-        if d["kind"] == "dealerinspire_llm":
-            rows = parse_llm(d, debug)
-        else:
-            rows = parse_jsonld(d, htmls, debug)
-        per_dealer.append((d, len(rows)))
-        all_rows.extend(rows)
+    try:
+        for d in DEALERS:
+            rows = (parse_llm(d, fetcher, debug) if d["kind"] == "dealerinspire_llm"
+                    else parse_jsonld(d, fetcher, debug))
+            per_dealer.append((d, len(rows)))
+            all_rows.extend(rows)
+    finally:
+        fetcher.close()
     return all_rows, per_dealer
 
 
