@@ -1,0 +1,38 @@
+name: Scrape MDX
+
+on:
+  schedule:
+    # Mon & Thu at 15:00 UTC (~7-8am Pacific)
+    - cron: "0 15 * * 1,4"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Scrape
+        run: python mdx_search.py
+
+      - name: Commit results
+        run: |
+          git config user.name "mdx-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add "*.csv"
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "MDX scrape $(date -u +%Y-%m-%d)"
+            git push
+          fi
