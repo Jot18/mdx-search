@@ -2,21 +2,25 @@
 """
 mdx_search.py — find new Acura MDX listings around Yuba City, CA.
 
-Dealer sites block bare HTTP requests (403), so by default this renders each
-page with a real headless Chromium via Playwright, then parses the structured
-schema.org JSON-LD. No API key, no credit card.
+Source-aware per dealer:
+  * DealerInspire dealers (e.g. Elk Grove Acura) expose a sanctioned, JS-free
+    /llm/inventory/ endpoint. Parsed with plain HTTP — no browser, works from
+    anywhere including GitHub cloud runners.
+  * Dealer.com dealers (e.g. Niello Acura) block plain requests and render
+    inventory with JavaScript, so those are loaded with a real headless
+    Chromium (Playwright) and read from schema.org JSON-LD.
+
+If Playwright isn't installed (or a render fails), Dealer.com dealers are
+skipped with a warning and the /llm/ dealers still return results.
 
 Setup:
     pip install -r requirements.txt
-    python -m playwright install chromium
+    python -m playwright install chromium   # only needed for Dealer.com dealers
 
 Usage:
-    python mdx_search.py            # render with Chromium (default)
-    python mdx_search.py --requests # plain HTTP (fast, but dealers 403 it)
-    python mdx_search.py --json     # machine-readable output
-    python mdx_search.py --debug    # show diagnostics per page
-
-Add or change dealers in the DEALERS list below.
+    python mdx_search.py           # search around Yuba City
+    python mdx_search.py --json
+    python mdx_search.py --debug
 """
 import os
 import re
@@ -24,7 +28,6 @@ import sys
 import csv
 import json
 import html
-import time
 import argparse
 import statistics
 import datetime
@@ -32,23 +35,19 @@ import datetime
 import requests
 from bs4 import BeautifulSoup
 
-# --- Dealers near Yuba City (each URL is tried; results deduped by VIN) --------
+# --- Dealers near Yuba City ---------------------------------------------------
 DEALERS = [
-    {
-        "name": "Niello Acura",
-        "city": "Roseville, CA",
-        "urls": [
-            "https://acura.niello.com/sacramento-ca/acura-mdx-inventory.htm",
-            "https://acura.niello.com/new-inventory/index.htm?model=MDX",
-        ],
-    },
     {
         "name": "Elk Grove Acura",
         "city": "Elk Grove, CA",
-        "urls": [
-            "https://www.elkgroveacura.com/new-vehicles/mdx/",
-            "https://www.elkgroveacura.com/new-inventory/index.htm?model=MDX",
-        ],
+        "kind": "dealerinspire_llm",
+        "base": "https://www.elkgroveacura.com/llm/inventory/",
+    },
+    {
+        "name": "Niello Acura",
+        "city": "Roseville, CA",
+        "kind": "jsonld_render",
+        "urls": ["https://acura.niello.com/new-inventory/index.htm?model=MDX"],
     },
 ]
 
@@ -71,11 +70,9 @@ def num(v):
     return None
 
 
-# ---- fetching ---------------------------------------------------------------
 def fetch_requests(url, debug=False):
     try:
-        r = requests.get(url, headers={"User-Agent": UA,
-                                       "Accept": "text/html,application/xhtml+xml"},
+        r = requests.get(url, headers={"User-Agent": UA, "Accept": "text/html"},
                          timeout=45)
         r.raise_for_status()
         return r.text
@@ -85,46 +82,88 @@ def fetch_requests(url, debug=False):
         return ""
 
 
+# --- DealerInspire /llm/ endpoint (plain HTTP, no browser) --------------------
+LLM_BLOCK = re.compile(
+    r"-\s*\[(?P<title>[^\]]+)\]\((?P<url>https?://[^)]+)\)\s*\n"
+    r"\s*(?P<cond>New|Certified Used|Used)\b[^\n]*\n"
+    r"\s*(?P<price>Call for price|\$[\d,]+)[^\n]*\n"
+    r"\s*VIN:\s*(?P<vin>[A-Za-z0-9]+)",
+    re.MULTILINE,
+)
+
+
+def parse_llm(dealer, debug=False):
+    found, seen = [], set()
+    page, total_pages = 1, 1
+    while page <= total_pages and page <= 8:
+        url = f"{dealer['base']}?make=Acura&limit=100&page={page}"
+        if debug:
+            print(f"  GET {url}", file=sys.stderr)
+        text = fetch_requests(url, debug)
+        if not text:
+            break
+        m = re.search(r"Page\s+\d+\s+of\s+(\d+)", text)
+        if m:
+            total_pages = int(m.group(1))
+        n_here = 0
+        for mo in LLM_BLOCK.finditer(text):
+            title = mo.group("title").strip()
+            if mo.group("cond") != "New" or "MDX" not in title or "Acura" not in title:
+                continue
+            vin = mo.group("vin")
+            if vin in seen:
+                continue
+            seen.add(vin)
+            price = None if mo.group("price").startswith("Call") else num(mo.group("price"))
+            found.append({"price": price, "msrp": None, "discount": None,
+                          "name": title, "vin": vin, "url": mo.group("url"),
+                          "dealer": dealer["name"], "city": dealer["city"]})
+            n_here += 1
+        if debug:
+            print(f"    page {page}/{total_pages}: {n_here} new MDX", file=sys.stderr)
+        page += 1
+    return found
+
+
+# --- Dealer.com via Playwright + JSON-LD --------------------------------------
 def render_all(urls, debug=False):
-    """Render each URL with a real headless Chromium; return {url: html}."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        print("Playwright not installed. Run:\n"
-              "    pip install playwright\n"
-              "    python -m playwright install chromium\n"
-              "(or use --requests, though dealers tend to 403 that).", file=sys.stderr)
-        sys.exit(1)
-
+        print("  (Playwright not installed — skipping Dealer.com dealers. "
+              "Run `pip install playwright && python -m playwright install chromium` "
+              "to include them.)", file=sys.stderr)
+        return {}
     out = {}
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-        )
-        ctx = browser.new_context(user_agent=UA, locale="en-US",
-                                  viewport={"width": 1366, "height": 900})
-        ctx.add_init_script(
-            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
-        page = ctx.new_page()
-        for url in urls:
-            try:
-                if debug:
-                    print(f"  render {url}", file=sys.stderr)
-                page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_timeout(3500)  # let inventory JS populate
-                out[url] = page.content()
-                if debug:
-                    print(f"    got {len(out[url])} bytes", file=sys.stderr)
-            except Exception as e:  # noqa: BLE001
-                if debug:
-                    print(f"    render failed: {e}", file=sys.stderr)
-                out[url] = ""
-        browser.close()
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"])
+            ctx = browser.new_context(user_agent=UA, locale="en-US",
+                                      viewport={"width": 1366, "height": 900})
+            ctx.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+            page = ctx.new_page()
+            for url in urls:
+                try:
+                    if debug:
+                        print(f"  render {url}", file=sys.stderr)
+                    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    page.wait_for_timeout(3500)
+                    out[url] = page.content()
+                    if debug:
+                        print(f"    got {len(out[url])} bytes", file=sys.stderr)
+                except Exception as e:  # noqa: BLE001
+                    if debug:
+                        print(f"    render failed: {e}", file=sys.stderr)
+                    out[url] = ""
+            browser.close()
+    except Exception as e:  # noqa: BLE001
+        print(f"  (browser error: {e})", file=sys.stderr)
     return out
 
 
-# ---- parsing ----------------------------------------------------------------
 def walk(node):
     if isinstance(node, dict):
         yield node
@@ -185,15 +224,6 @@ def name_of(node):
     return str(n).strip()
 
 
-def url_of(node):
-    if node.get("url"):
-        return node["url"]
-    offers = node.get("offers")
-    if isinstance(offers, dict) and offers.get("url"):
-        return offers["url"]
-    return ""
-
-
 def matches_mdx(node):
     hay = " ".join(str(node.get(k, "")) for k in ("name", "model", "description", "sku"))
     if isinstance(node.get("model"), dict):
@@ -201,39 +231,44 @@ def matches_mdx(node):
     return MODEL.lower() in hay.lower()
 
 
-def search(use_requests=False, debug=False):
-    pairs = [(d, u) for d in DEALERS for u in d["urls"]]
-    if use_requests:
-        htmls = {u: fetch_requests(u, debug) for _, u in pairs}
-    else:
-        htmls = render_all([u for _, u in pairs], debug)
+def parse_jsonld(dealer, htmls, debug=False):
+    found, seen = [], set()
+    for url in dealer["urls"]:
+        text = htmls.get(url, "")
+        if not text:
+            continue
+        for node in jsonld_nodes(text, debug=debug):
+            if not isinstance(node, dict) or not matches_mdx(node):
+                continue
+            sale, msrp = prices_from(node)
+            if sale is None and msrp is None:
+                continue
+            vin = node.get("vin") or node.get("sku") or ""
+            key = vin or (name_of(node), sale, msrp)
+            if key in seen:
+                continue
+            seen.add(key)
+            disc = (msrp - sale) if (msrp and sale and msrp >= sale) else None
+            u = node.get("url") or ""
+            found.append({"price": sale, "msrp": msrp, "discount": disc,
+                          "name": name_of(node), "vin": vin, "url": u,
+                          "dealer": dealer["name"], "city": dealer["city"]})
+    return found
+
+
+# --- driver -------------------------------------------------------------------
+def search(debug=False):
+    render_urls = [u for d in DEALERS if d["kind"] == "jsonld_render" for u in d["urls"]]
+    htmls = render_all(render_urls, debug) if render_urls else {}
 
     all_rows, per_dealer = [], []
     for d in DEALERS:
-        seen, found = set(), []
-        for url in d["urls"]:
-            text = htmls.get(url, "")
-            if not text:
-                continue
-            for node in jsonld_nodes(text, debug=debug):
-                if not isinstance(node, dict) or not matches_mdx(node):
-                    continue
-                sale, msrp = prices_from(node)
-                if sale is None and msrp is None:
-                    continue
-                vin = node.get("vin") or node.get("sku") or ""
-                key = vin or (name_of(node), sale, msrp)
-                if key in seen:
-                    continue
-                seen.add(key)
-                disc = (msrp - sale) if (msrp and sale and msrp >= sale) else None
-                found.append({
-                    "price": sale, "msrp": msrp, "discount": disc,
-                    "name": name_of(node), "vin": vin, "url": url_of(node),
-                    "dealer": d["name"], "city": d["city"],
-                })
-        per_dealer.append((d, len(found)))
-        all_rows.extend(found)
+        if d["kind"] == "dealerinspire_llm":
+            rows = parse_llm(d, debug)
+        else:
+            rows = parse_jsonld(d, htmls, debug)
+        per_dealer.append((d, len(rows)))
+        all_rows.extend(rows)
     return all_rows, per_dealer
 
 
@@ -243,13 +278,12 @@ def money(n):
 
 def main():
     ap = argparse.ArgumentParser(description="Find new Acura MDX listings around Yuba City.")
-    ap.add_argument("--json", action="store_true", help="output JSON instead of a table")
-    ap.add_argument("--requests", action="store_true", help="use plain HTTP (dealers 403 it)")
-    ap.add_argument("--debug", action="store_true", help="show scraping diagnostics")
-    ap.add_argument("--no-csv", action="store_true", help="don't write CSV files")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--no-csv", action="store_true")
     args = ap.parse_args()
 
-    rows, per_dealer = search(use_requests=args.requests, debug=args.debug)
+    rows, per_dealer = search(debug=args.debug)
     rows.sort(key=lambda r: (r["price"] is None, r["price"] or 0))
 
     if args.json:
@@ -259,35 +293,28 @@ def main():
     today = datetime.date.today().isoformat()
     print(f"\nAcura MDX — new, around Yuba City · {today}\n")
     for d, n in per_dealer:
-        mark = "✓" if n else "·"
-        print(f"  {mark} {d['name']:<18} {d['city']:<16} {n} found")
+        print(f"  {'✓' if n else '·'} {d['name']:<18} {d['city']:<16} {n} found")
     print()
 
     if not rows:
-        print("No listings parsed. Run `python mdx_search.py --debug` to see whether pages")
-        print("were blocked (403 / 0 bytes) or returned no JSON-LD, and share the output.\n")
+        print("No listings parsed. Run with --debug to see what each source returned.\n")
         return
 
-    print(f"  {'PRICE':>9}  {'MSRP':>9}  {'SAVE':>7}  {'TRIM / NAME':<34} DEALER")
-    print("  " + "-" * 78)
+    print(f"  {'PRICE':>9}  {'MSRP':>9}  {'SAVE':>7}  {'TRIM / NAME':<36} DEALER")
+    print("  " + "-" * 80)
     for r in rows:
         save = money(r["discount"]) if r["discount"] else ""
-        name = (r["name"] or "").replace("New ", "")[:34]
-        print(f"  {money(r['price']):>9}  {money(r['msrp']):>9}  {save:>7}  {name:<34} {r['dealer']}")
+        name = (r["name"] or "").replace("New ", "")[:36]
+        print(f"  {money(r['price']):>9}  {money(r['msrp']):>9}  {save:>7}  {name:<36} {r['dealer']}")
 
     prices = [r["price"] for r in rows if r["price"]]
     discs = [r["discount"] for r in rows if r["discount"]]
-    print("  " + "-" * 78)
+    print("  " + "-" * 80)
     line = f"  {len(rows)} listings"
     if prices:
         line += f" · median {money(statistics.median(prices))} · low {money(min(prices))}"
     if discs:
-        best = max(discs)
-        bpct = next((d["discount"] / d["msrp"] * 100 for d in rows
-                     if d["discount"] == best and d["msrp"]), None)
-        line += f" · best save {money(best)}"
-        if bpct:
-            line += f" ({bpct:.1f}%)"
+        line += f" · best save {money(max(discs))}"
     print(line + "\n")
 
     if not args.no_csv:
